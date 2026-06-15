@@ -7,6 +7,249 @@
 #import "ImageCompressPlugin.h"
 @import ImageIO;
 @import SDWebImageWebPCoder;
+#if __has_include(<libwebp/mux.h>)
+#import <libwebp/decode.h>
+#import <libwebp/mux.h>
+#else
+#import <webp/decode.h>
+#import <webp/mux.h>
+#endif
+
+static uint16_t FICReadUInt16(const uint8_t *bytes, NSUInteger offset, BOOL littleEndian) {
+    if (littleEndian) {
+        return (uint16_t)(bytes[offset] | (bytes[offset + 1] << 8));
+    }
+    return (uint16_t)((bytes[offset] << 8) | bytes[offset + 1]);
+}
+
+static uint32_t FICReadUInt32(const uint8_t *bytes, NSUInteger offset, BOOL littleEndian) {
+    if (littleEndian) {
+        return (uint32_t)bytes[offset]
+            | ((uint32_t)bytes[offset + 1] << 8)
+            | ((uint32_t)bytes[offset + 2] << 16)
+            | ((uint32_t)bytes[offset + 3] << 24);
+    }
+    return ((uint32_t)bytes[offset] << 24)
+        | ((uint32_t)bytes[offset + 1] << 16)
+        | ((uint32_t)bytes[offset + 2] << 8)
+        | (uint32_t)bytes[offset + 3];
+}
+
+static void FICWriteUInt16(uint8_t *bytes, NSUInteger offset, uint16_t value, BOOL littleEndian) {
+    if (littleEndian) {
+        bytes[offset] = (uint8_t)(value & 0xff);
+        bytes[offset + 1] = (uint8_t)(value >> 8);
+    } else {
+        bytes[offset] = (uint8_t)(value >> 8);
+        bytes[offset + 1] = (uint8_t)(value & 0xff);
+    }
+}
+
+static void FICWriteUInt32(uint8_t *bytes, NSUInteger offset, uint32_t value, BOOL littleEndian) {
+    if (littleEndian) {
+        bytes[offset] = (uint8_t)(value & 0xff);
+        bytes[offset + 1] = (uint8_t)((value >> 8) & 0xff);
+        bytes[offset + 2] = (uint8_t)((value >> 16) & 0xff);
+        bytes[offset + 3] = (uint8_t)(value >> 24);
+    } else {
+        bytes[offset] = (uint8_t)(value >> 24);
+        bytes[offset + 1] = (uint8_t)((value >> 16) & 0xff);
+        bytes[offset + 2] = (uint8_t)((value >> 8) & 0xff);
+        bytes[offset + 3] = (uint8_t)(value & 0xff);
+    }
+}
+
+static void FICWriteIFDValue(uint8_t *bytes, NSUInteger entryOffset, uint16_t type, uint32_t value,
+                             BOOL littleEndian) {
+    if (type == 3 && value <= UINT16_MAX) { // SHORT
+        FICWriteUInt16(bytes, entryOffset + 8, (uint16_t)value, littleEndian);
+        bytes[entryOffset + 10] = 0;
+        bytes[entryOffset + 11] = 0;
+    } else if (type == 4) { // LONG
+        FICWriteUInt32(bytes, entryOffset + 8, value, littleEndian);
+    }
+}
+
+static uint32_t FICPatchIFD(uint8_t *bytes, NSUInteger length, uint32_t ifdOffset, BOOL littleEndian,
+                            uint32_t width, uint32_t height, BOOL exifIFD) {
+    if (ifdOffset > length || length - ifdOffset < 2) {
+        return 0;
+    }
+
+    uint16_t entryCount = FICReadUInt16(bytes, ifdOffset, littleEndian);
+    NSUInteger entriesOffset = (NSUInteger)ifdOffset + 2;
+    if (entryCount > (length - entriesOffset) / 12) {
+        return 0;
+    }
+
+    uint32_t nestedExifOffset = 0;
+    for (uint16_t index = 0; index < entryCount; index++) {
+        NSUInteger entryOffset = entriesOffset + (NSUInteger)index * 12;
+        uint16_t tag = FICReadUInt16(bytes, entryOffset, littleEndian);
+        uint16_t type = FICReadUInt16(bytes, entryOffset + 2, littleEndian);
+        uint32_t count = FICReadUInt32(bytes, entryOffset + 4, littleEndian);
+        if (count != 1) {
+            continue;
+        }
+
+        if (!exifIFD && tag == 0x8769 && type == 4) { // ExifIFDPointer
+            nestedExifOffset = FICReadUInt32(bytes, entryOffset + 8, littleEndian);
+        } else if (!exifIFD && tag == 0x0112) { // Orientation
+            FICWriteIFDValue(bytes, entryOffset, type, 1, littleEndian);
+        } else if (!exifIFD && tag == 0x0100) { // ImageWidth
+            FICWriteIFDValue(bytes, entryOffset, type, width, littleEndian);
+        } else if (!exifIFD && tag == 0x0101) { // ImageLength
+            FICWriteIFDValue(bytes, entryOffset, type, height, littleEndian);
+        } else if (exifIFD && tag == 0xa002) { // PixelXDimension
+            FICWriteIFDValue(bytes, entryOffset, type, width, littleEndian);
+        } else if (exifIFD && tag == 0xa003) { // PixelYDimension
+            FICWriteIFDValue(bytes, entryOffset, type, height, littleEndian);
+        }
+    }
+    return nestedExifOffset;
+}
+
+static BOOL FICNormalizeTIFFData(NSMutableData *data, uint32_t width, uint32_t height) {
+    if (data.length < 8) {
+        return NO;
+    }
+
+    uint8_t *bytes = data.mutableBytes;
+    BOOL littleEndian;
+    if (bytes[0] == 'I' && bytes[1] == 'I') {
+        littleEndian = YES;
+    } else if (bytes[0] == 'M' && bytes[1] == 'M') {
+        littleEndian = NO;
+    } else {
+        return NO;
+    }
+    if (FICReadUInt16(bytes, 2, littleEndian) != 42) {
+        return NO;
+    }
+
+    uint32_t ifdOffset = FICReadUInt32(bytes, 4, littleEndian);
+    uint32_t exifOffset = FICPatchIFD(bytes, data.length, ifdOffset, littleEndian, width, height, NO);
+    if (exifOffset != 0) {
+        FICPatchIFD(bytes, data.length, exifOffset, littleEndian, width, height, YES);
+    }
+    return YES;
+}
+
+static NSData *FICExtractTIFFDataFromJPEG(NSData *jpegData) {
+    const uint8_t *bytes = jpegData.bytes;
+    NSUInteger length = jpegData.length;
+    if (length < 4 || bytes[0] != 0xff || bytes[1] != 0xd8) {
+        return nil;
+    }
+
+    NSUInteger offset = 2;
+    while (offset + 4 <= length) {
+        if (bytes[offset] != 0xff) {
+            return nil;
+        }
+        while (offset < length && bytes[offset] == 0xff) {
+            offset++;
+        }
+        if (offset >= length) {
+            return nil;
+        }
+
+        uint8_t marker = bytes[offset++];
+        if (marker == 0xd9 || marker == 0xda) {
+            break;
+        }
+        if (marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+            continue;
+        }
+        if (offset + 2 > length) {
+            return nil;
+        }
+
+        uint16_t segmentLength = (uint16_t)((bytes[offset] << 8) | bytes[offset + 1]);
+        if (segmentLength < 2 || segmentLength > length - offset) {
+            return nil;
+        }
+        NSUInteger payloadOffset = offset + 2;
+        NSUInteger payloadLength = segmentLength - 2;
+        if (marker == 0xe1 && payloadLength >= 6
+            && memcmp(bytes + payloadOffset, "Exif\0\0", 6) == 0) {
+            return [jpegData subdataWithRange:NSMakeRange(payloadOffset + 6, payloadLength - 6)];
+        }
+        offset += segmentLength;
+    }
+    return nil;
+}
+
+static NSData *FICCreateTIFFData(NSDictionary *sourceProperties, uint32_t width, uint32_t height) {
+    NSDictionary *sourceExif = sourceProperties[(NSString *)kCGImagePropertyExifDictionary];
+    NSDictionary *sourceTIFF = sourceProperties[(NSString *)kCGImagePropertyTIFFDictionary];
+    NSDictionary *sourceGPS = sourceProperties[(NSString *)kCGImagePropertyGPSDictionary];
+    NSNumber *sourceOrientation = sourceProperties[(NSString *)kCGImagePropertyOrientation];
+    if (sourceExif.count == 0 && sourceTIFF.count == 0 && sourceGPS.count == 0 && sourceOrientation == nil) {
+        return nil;
+    }
+
+    NSMutableDictionary *properties = [sourceProperties mutableCopy];
+    [properties removeObjectForKey:(NSString *)kCGImagePropertyPixelWidth];
+    [properties removeObjectForKey:(NSString *)kCGImagePropertyPixelHeight];
+    [properties removeObjectForKey:(NSString *)kCGImagePropertyFileSize];
+    [properties removeObjectForKey:(NSString *)kCGImagePropertyProfileName];
+    [properties removeObjectForKey:(NSString *)kCGImagePropertyColorModel];
+    [properties removeObjectForKey:(NSString *)kCGImagePropertyDepth];
+    [properties removeObjectForKey:(NSString *)kCGImagePropertyHasAlpha];
+    [properties removeObjectForKey:(NSString *)kCGImagePropertyIsFloat];
+    [properties removeObjectForKey:(NSString *)kCGImagePropertyIsIndexed];
+    properties[(NSString *)kCGImagePropertyOrientation] = @1;
+
+    NSMutableDictionary *tiff = sourceTIFF != nil ? [sourceTIFF mutableCopy] : [NSMutableDictionary dictionary];
+    tiff[(NSString *)kCGImagePropertyTIFFOrientation] = @1;
+    properties[(NSString *)kCGImagePropertyTIFFDictionary] = tiff;
+
+    if (sourceExif != nil) {
+        NSMutableDictionary *exif = [sourceExif mutableCopy];
+        exif[(NSString *)kCGImagePropertyExifPixelXDimension] = @(width);
+        exif[(NSString *)kCGImagePropertyExifPixelYDimension] = @(height);
+        properties[(NSString *)kCGImagePropertyExifDictionary] = exif;
+    }
+
+    uint8_t pixel[4] = {0, 0, 0, 255};
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    if (colorSpace == NULL) {
+        return nil;
+    }
+    CGContextRef context = CGBitmapContextCreate(pixel, 1, 1, 8, 4, colorSpace, kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(colorSpace);
+    if (context == NULL) {
+        return nil;
+    }
+    CGImageRef image = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+    if (image == NULL) {
+        return nil;
+    }
+
+    NSMutableData *jpegData = [NSMutableData data];
+    CGImageDestinationRef destination = CGImageDestinationCreateWithData(
+        (__bridge CFMutableDataRef)jpegData, CFSTR("public.jpeg"), 1, NULL);
+    if (destination == NULL) {
+        CGImageRelease(image);
+        return nil;
+    }
+    CGImageDestinationAddImage(destination, image, (__bridge CFDictionaryRef)properties);
+    BOOL success = CGImageDestinationFinalize(destination);
+    CFRelease(destination);
+    CGImageRelease(image);
+    if (!success) {
+        return nil;
+    }
+
+    NSData *rawTIFFData = FICExtractTIFFDataFromJPEG(jpegData);
+    if (rawTIFFData.length == 0) {
+        return nil;
+    }
+    NSMutableData *tiffData = [rawTIFFData mutableCopy];
+    return FICNormalizeTIFFData(tiffData, width, height) ? tiffData : nil;
+}
 
 @implementation CompressHandler {
 
@@ -117,6 +360,10 @@
         return nil;
     }
 
+    if ([self isWebP:encodedData]) {
+        return [self webPDataByCopyingMetadataFromSource:sourceData intoEncoded:encodedData];
+    }
+
     CGImageSourceRef sourceRef = CGImageSourceCreateWithData((__bridge CFDataRef)sourceData, NULL);
     if (sourceRef == NULL) {
         if ([ImageCompressPlugin showLog]) {
@@ -210,6 +457,55 @@
     // Treat zero-length output as failure so the caller falls back to the
     // original encoded bytes.
     return mergedData.length > 0 ? mergedData : nil;
+}
+
++ (NSData *)webPDataByCopyingMetadataFromSource:(NSData *)sourceData
+                                     intoEncoded:(NSData *)encodedData {
+    int width = 0;
+    int height = 0;
+    if (!WebPGetInfo(encodedData.bytes, encodedData.length, &width, &height) || width <= 0 || height <= 0) {
+        return nil;
+    }
+
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)sourceData, NULL);
+    if (source == NULL) {
+        return nil;
+    }
+
+    NSDictionary *metadata = (NSDictionary *)CFBridgingRelease(
+        CGImageSourceCopyPropertiesAtIndex(source, 0, NULL));
+    CFRelease(source);
+    if (metadata == nil) {
+        return nil;
+    }
+
+    NSData *metadataData = FICCreateTIFFData(metadata, (uint32_t)width, (uint32_t)height);
+    if (metadataData.length == 0) {
+        return nil;
+    }
+
+    WebPData webPData = {encodedData.bytes, encodedData.length};
+    WebPMux *mux = WebPMuxCreate(&webPData, 1);
+    if (mux == NULL) {
+        return nil;
+    }
+
+    WebPData exifData = {metadataData.bytes, metadataData.length};
+    if (WebPMuxSetChunk(mux, "EXIF", &exifData, 0) != WEBP_MUX_OK) {
+        WebPMuxDelete(mux);
+        return nil;
+    }
+
+    WebPData outputData = {0};
+    if (WebPMuxAssemble(mux, &outputData) != WEBP_MUX_OK) {
+        WebPMuxDelete(mux);
+        return nil;
+    }
+
+    NSData *result = [NSData dataWithBytes:outputData.bytes length:outputData.size];
+    WebPDataClear(&outputData);
+    WebPMuxDelete(mux);
+    return result;
 }
 
 @end

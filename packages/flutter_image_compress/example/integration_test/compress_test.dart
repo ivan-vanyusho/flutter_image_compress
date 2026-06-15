@@ -607,6 +607,37 @@ void main() {
             expected: DetectedFormat.webp,
             description: 'WebP + keepExif',
           );
+          if (Platform.isIOS) {
+            final exifPayload = readWebPExifChunk(result);
+            expect(exifPayload, isNotNull, reason: 'iOS WebP must contain an EXIF chunk');
+            final payload = exifPayload!;
+            expect(payload.length, greaterThanOrEqualTo(4));
+            expect(
+              payload.sublist(0, 4),
+              anyOf(
+                equals(const [0x49, 0x49, 0x2a, 0x00]),
+                equals(const [0x4d, 0x4d, 0x00, 0x2a]),
+              ),
+              reason: 'WebP EXIF payload must start with a TIFF header, not JSON or a JPEG APP1 prefix',
+            );
+            final sourceKeys = (await readExifKeys(src)).toSet();
+            final resultKeys = (await readExifKeys(result)).toSet();
+            expect(
+              resultKeys,
+              isNotEmpty,
+              reason: 'iOS WebP + keepExif=true must contain readable TIFF/EXIF metadata',
+            );
+            expect(
+              resultKeys.intersection(sourceKeys),
+              isNotEmpty,
+              reason: 'iOS WebP must retain metadata from the source image',
+            );
+            expect(
+              await readExifOrientation(result),
+              1,
+              reason: 'WebP pixels are normalized during compression, so EXIF Orientation must be 1',
+            );
+          }
         },
         // WebP is iOS/Android only in the common package.
         skip: !(Platform.isIOS || Platform.isAndroid),

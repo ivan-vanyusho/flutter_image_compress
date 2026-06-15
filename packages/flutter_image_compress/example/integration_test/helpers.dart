@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
@@ -67,6 +68,29 @@ DetectedFormat detectFormat(Uint8List bytes) {
   return DetectedFormat.unknown;
 }
 
+Uint8List? readWebPExifChunk(Uint8List bytes) {
+  if (detectFormat(bytes) != DetectedFormat.webp) {
+    return null;
+  }
+  final data = ByteData.sublistView(bytes);
+  var offset = 12;
+  while (offset + 8 <= bytes.length) {
+    final chunkSize = data.getUint32(offset + 4, Endian.little);
+    final chunkEnd = offset + 8 + chunkSize;
+    if (chunkEnd > bytes.length) {
+      return null;
+    }
+    if (bytes[offset] == 0x45 &&
+        bytes[offset + 1] == 0x58 &&
+        bytes[offset + 2] == 0x49 &&
+        bytes[offset + 3] == 0x46) {
+      return Uint8List.sublistView(bytes, offset + 8, chunkEnd);
+    }
+    offset = chunkEnd + chunkSize.remainder(2);
+  }
+  return null;
+}
+
 /// Simple width/height pair for tests that only need the decoded dimensions.
 class ImageDimensions {
   const ImageDimensions(this.width, this.height);
@@ -119,6 +143,9 @@ Future<List<String>> readExifKeys(Uint8List bytes) async {
   }
   return result.whereType<String>().toList(growable: false);
 }
+
+Future<int?> readExifOrientation(Uint8List bytes) =>
+    testHelperChannel.invokeMethod<int>('readExifOrientation', bytes);
 
 /// Scan [bytes] as a decoded image and return whether *any* pixel has an
 /// alpha channel value below 255 (i.e. at least one non-opaque pixel).

@@ -32,15 +32,18 @@ enum ExifTestHelper {
       binaryMessenger: messenger
     )
     channel.setMethodCallHandler { call, result in
-      guard call.method == "readExifKeys" else {
-        result(FlutterMethodNotImplemented)
-        return
-      }
       guard let typed = call.arguments as? FlutterStandardTypedData else {
-        result([String]())
+        result(nil)
         return
       }
-      result(readExifKeys(from: typed.data))
+      switch call.method {
+      case "readExifKeys":
+        result(readExifKeys(from: typed.data))
+      case "readExifOrientation":
+        result(readExifOrientation(from: typed.data))
+      default:
+        result(FlutterMethodNotImplemented)
+      }
     }
   }
 
@@ -70,5 +73,18 @@ enum ExifTestHelper {
       }
     }
     return keys
+  }
+
+  private static func readExifOrientation(from data: Data) -> Int? {
+    guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+          let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+    else {
+      return nil
+    }
+    if let orientation = props[kCGImagePropertyOrientation] as? NSNumber {
+      return orientation.intValue
+    }
+    let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any]
+    return (tiff?[kCGImagePropertyTIFFOrientation] as? NSNumber)?.intValue
   }
 }
