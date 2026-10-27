@@ -94,8 +94,6 @@ static uint32_t FICPatchIFD(uint8_t *bytes, NSUInteger length, uint32_t ifdOffse
 
         if (!exifIFD && tag == 0x8769 && type == 4) { // ExifIFDPointer
             nestedExifOffset = FICReadUInt32(bytes, entryOffset + 8, littleEndian);
-        } else if (!exifIFD && tag == 0x0112) { // Orientation
-            FICWriteIFDValue(bytes, entryOffset, type, 1, littleEndian);
         } else if (!exifIFD && tag == 0x0100) { // ImageWidth
             FICWriteIFDValue(bytes, entryOffset, type, width, littleEndian);
         } else if (!exifIFD && tag == 0x0101) { // ImageLength
@@ -185,6 +183,9 @@ static NSData *FICCreateTIFFData(NSDictionary *sourceProperties, uint32_t width,
     NSDictionary *sourceTIFF = sourceProperties[(NSString *)kCGImagePropertyTIFFDictionary];
     NSDictionary *sourceGPS = sourceProperties[(NSString *)kCGImagePropertyGPSDictionary];
     NSNumber *sourceOrientation = sourceProperties[(NSString *)kCGImagePropertyOrientation];
+    if (sourceOrientation == nil) {
+        sourceOrientation = sourceTIFF[(NSString *)kCGImagePropertyTIFFOrientation];
+    }
     if (sourceExif.count == 0 && sourceTIFF.count == 0 && sourceGPS.count == 0 && sourceOrientation == nil) {
         return nil;
     }
@@ -199,10 +200,11 @@ static NSData *FICCreateTIFFData(NSDictionary *sourceProperties, uint32_t width,
     [properties removeObjectForKey:(NSString *)kCGImagePropertyHasAlpha];
     [properties removeObjectForKey:(NSString *)kCGImagePropertyIsFloat];
     [properties removeObjectForKey:(NSString *)kCGImagePropertyIsIndexed];
-    properties[(NSString *)kCGImagePropertyOrientation] = @1;
-
     NSMutableDictionary *tiff = sourceTIFF != nil ? [sourceTIFF mutableCopy] : [NSMutableDictionary dictionary];
-    tiff[(NSString *)kCGImagePropertyTIFFOrientation] = @1;
+    if (sourceOrientation != nil) {
+        properties[(NSString *)kCGImagePropertyOrientation] = sourceOrientation;
+        tiff[(NSString *)kCGImagePropertyTIFFOrientation] = sourceOrientation;
+    }
     properties[(NSString *)kCGImagePropertyTIFFDictionary] = tiff;
 
     if (sourceExif != nil) {
@@ -403,10 +405,9 @@ static NSData *FICCreateTIFFData(NSDictionary *sourceProperties, uint32_t width,
         return nil;
     }
 
-    // The pipeline scales and (optionally) rotates before re-encoding, so the
-    // source's PixelWidth/PixelHeight and Orientation no longer describe the
-    // encoded pixels. Overwrite them so viewers don't double-rotate or read
-    // stale dimensions. Also drop keys that describe the source's *pixel
+    // PixelWidth/PixelHeight no longer describe the encoded pixels. Preserve
+    // the source orientation requested by keepExif, but drop stale dimensions
+    // and keys that describe the source's *pixel
     // buffer* (color profile, depth, alpha channel, indexed/float model) —
     // those describe the source, not the re-encoded output. Passing a stale
     // ProfileName from a Display-P3 source into an sRGB JPEG output makes
@@ -423,12 +424,17 @@ static NSData *FICCreateTIFFData(NSDictionary *sourceProperties, uint32_t width,
     [props removeObjectForKey:(NSString *)kCGImagePropertyHasAlpha];
     [props removeObjectForKey:(NSString *)kCGImagePropertyIsFloat];
     [props removeObjectForKey:(NSString *)kCGImagePropertyIsIndexed];
-    props[(NSString *)kCGImagePropertyOrientation] = @1;
-
     NSDictionary *tiffDict = props[(NSString *)kCGImagePropertyTIFFDictionary];
-    if ([tiffDict isKindOfClass:[NSDictionary class]]) {
-        NSMutableDictionary *tiff = [tiffDict mutableCopy];
-        tiff[(NSString *)kCGImagePropertyTIFFOrientation] = @1;
+    NSNumber *sourceOrientation = rawSourceProps[(NSString *)kCGImagePropertyOrientation];
+    if (sourceOrientation == nil && [tiffDict isKindOfClass:[NSDictionary class]]) {
+        sourceOrientation = tiffDict[(NSString *)kCGImagePropertyTIFFOrientation];
+    }
+    if (sourceOrientation != nil) {
+        props[(NSString *)kCGImagePropertyOrientation] = sourceOrientation;
+        NSMutableDictionary *tiff = [tiffDict isKindOfClass:[NSDictionary class]]
+            ? [tiffDict mutableCopy]
+            : [NSMutableDictionary dictionary];
+        tiff[(NSString *)kCGImagePropertyTIFFOrientation] = sourceOrientation;
         props[(NSString *)kCGImagePropertyTIFFDictionary] = tiff;
     }
 

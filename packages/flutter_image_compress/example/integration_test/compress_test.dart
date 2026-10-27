@@ -632,10 +632,12 @@ void main() {
               isNotEmpty,
               reason: 'iOS WebP must retain metadata from the source image',
             );
+            final sourceOrientation = await readExifOrientation(src);
+            expect(sourceOrientation, isNotNull, reason: 'The source fixture must contain EXIF Orientation');
             expect(
               await readExifOrientation(result),
-              1,
-              reason: 'WebP pixels are normalized during compression, so EXIF Orientation must be 1',
+              sourceOrientation,
+              reason: 'iOS WebP must retain the source EXIF Orientation',
             );
           }
         },
